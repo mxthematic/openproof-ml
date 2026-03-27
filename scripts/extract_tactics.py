@@ -116,17 +116,15 @@ def parse_proof_tactics(proof_text: str) -> list[str]:
     if text.startswith("{") and text.endswith("}"):
         text = text[1:-1].strip()
 
-    # Split on newlines, filter empty lines and comments
+    # Split on newlines, filter empty lines and comments.
+    # Do NOT split on semicolons -- in Lean 4, `<;>` and `;` are tactic
+    # combinators (apply to all goals), not statement separators.
     tactics = []
     for line in text.split("\n"):
         line = line.strip()
         if not line or line.startswith("--") or line.startswith("/-"):
             continue
-        # Handle semicolon-separated tactics
-        for part in line.split(";"):
-            part = part.strip()
-            if part:
-                tactics.append(part)
+        tactics.append(line)
 
     return tactics
 
@@ -253,29 +251,39 @@ def extract_goedel_pset_direct(input_dir: Path) -> list[dict]:
 
 
 def split_full_proof(full_proof: str) -> tuple[str, str] | None:
-    """Split a full_proof field into (statement, proof_body).
+    """Split a full_proof field into (theorem_statement, proof_body).
 
-    full_proof looks like:
+    full_proof is an entire Lean file as a string:
         import Mathlib\nimport Aesop\nset_option ...\nopen ...\n
         theorem foo (x : Nat) : x = x := by\n  rfl
 
-    Returns (statement_line, proof_tactics_text) or None.
+    We find the last `:= by` (the proof start), walk backwards to find
+    `theorem`/`lemma`, and split there.
+
+    Returns (statement_without_by, proof_tactics_text) or None.
     """
-    # Find the ":= by" that separates statement from proof
-    by_idx = full_proof.find(":= by")
+    # Find the LAST ":= by" (in case imports have weird content)
+    by_idx = full_proof.rfind(":= by")
     if by_idx == -1:
         return None
 
-    # Walk backwards from ":= by" to find "theorem" or "lemma"
+    # Walk backwards to find "theorem" or "lemma" or "def"
     before_by = full_proof[:by_idx]
+    best_kw_idx = -1
     for keyword in ["theorem ", "lemma ", "def "]:
         kw_idx = before_by.rfind(keyword)
-        if kw_idx != -1:
-            statement = full_proof[kw_idx:by_idx + len(":= by")].strip()
-            proof_body = full_proof[by_idx + len(":= by"):].strip()
-            return (statement, proof_body)
+        if kw_idx > best_kw_idx:
+            best_kw_idx = kw_idx
 
-    return None
+    if best_kw_idx == -1:
+        return None
+
+    # statement = from "theorem" to just before ":= by"
+    statement = full_proof[best_kw_idx:by_idx].strip()
+    # proof_body = everything after ":= by"
+    proof_body = full_proof[by_idx + len(":= by"):].strip()
+
+    return (statement, proof_body)
 
 
 def extract_goedel_pset_replay(
@@ -336,14 +344,22 @@ def extract_goedel_pset_replay(
                 new_pairs = replay_proof_through_pantograph(
                     pantograph_client, type_expr, tactics
                 )
-                pairs.extend(new_pairs)
-                replayed += 1
+                if new_pairs:
+                    pairs.extend(new_pairs)
+                    replayed += 1
+                else:
+                    failed += 1
+                    if failed <= 5:
+                        logger.debug(
+                            f"Replay got 0 pairs for proof {i}: "
+                            f"type_expr={type_expr[:80]}... tactics={tactics[:2]}"
+                        )
             except Exception as e:
                 failed += 1
-                if failed <= 10:
-                    logger.debug(f"Replay failed for proof {i}: {e}")
+                if failed <= 5:
+                    logger.debug(f"Replay exception for proof {i}: {e}")
 
-            if (i + 1) % 10000 == 0:
+            if (i + 1) % 5000 == 0:
                 logger.info(
                     f"  Goedel-Pset replay progress: {i+1} processed, "
                     f"{replayed} replayed, {failed} failed, {len(pairs)} pairs"
@@ -359,8 +375,10 @@ def extract_goedel_pset_replay(
 def extract_type_from_statement(statement: str) -> str | None:
     """Extract a type expression from a Lean theorem statement.
 
-    Converts: theorem foo (x : Nat) : x + 0 = x := by ...
-    To: forall (x : Nat), x + 0 = x
+    Handles both formats:
+        theorem foo (x : Nat) : x + 0 = x := by ...
+        theorem foo (x : Nat) : x + 0 = x           (no := by)
+    Converts to: forall (x : Nat), x + 0 = x
     """
     # Find theorem/lemma keyword and strip it + name
     match = re.match(r"(?:theorem|lemma|def)\s+\S+\s*(.*)", statement, re.DOTALL)
@@ -369,14 +387,16 @@ def extract_type_from_statement(statement: str) -> str | None:
 
     rest = match.group(1).strip()
 
-    # Find ":= by" and take everything before it
+    # Strip trailing ":= by ..." or ":= ..." if present
     by_idx = rest.rfind(":= by")
-    if by_idx == -1:
-        by_idx = rest.rfind(":=")
-    if by_idx == -1:
-        return None
+    if by_idx != -1:
+        rest = rest[:by_idx].strip()
+    else:
+        eq_idx = rest.rfind(":=")
+        if eq_idx != -1:
+            rest = rest[:eq_idx].strip()
 
-    signature = rest[:by_idx].strip()
+    signature = rest
 
     # Find the last top-level ":" separating params from conclusion
     depth = 0
