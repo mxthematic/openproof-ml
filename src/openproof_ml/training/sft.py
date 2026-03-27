@@ -157,8 +157,17 @@ def main():
         tokenizer=tokenizer,
     )
 
+    # Resume from checkpoint if one exists
+    output_dir = Path(train_cfg["output_dir"])
+    last_checkpoint = None
+    if output_dir.exists():
+        checkpoints = sorted(output_dir.glob("checkpoint-*"))
+        if checkpoints:
+            last_checkpoint = str(checkpoints[-1])
+            logger.info(f"Resuming from checkpoint: {last_checkpoint}")
+
     logger.info("Starting SFT training")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=last_checkpoint)
     trainer.save_model()
     tokenizer.save_pretrained(train_cfg["output_dir"])
     logger.info(f"Model saved to {train_cfg['output_dir']}")
