@@ -144,7 +144,16 @@ def parse_proof_tactics(proof_text: str) -> list[str]:
 
 
 def extract_leandojo(input_dir: Path) -> list[dict]:
-    """Extract from LeanDojo format (pre-traced state/tactic pairs)."""
+    """Extract from LeanDojo/tasksource format.
+
+    The tasksource/leandojo dataset has nested traced_tactics:
+    {
+      "traced_tactics": [
+        {"state_before": "...", "tactic": "...", "state_after": "..."},
+        ...
+      ]
+    }
+    """
     pairs = []
     path = input_dir / "leandojo" / "train.jsonl"
     if not path.exists():
@@ -154,6 +163,27 @@ def extract_leandojo(input_dir: Path) -> list[dict]:
     with open(path) as f:
         for line in f:
             ex = json.loads(line)
+
+            # Handle nested traced_tactics (tasksource/leandojo format)
+            traced = ex.get("traced_tactics", [])
+            if traced:
+                for step in traced:
+                    if isinstance(step, dict):
+                        state = step.get("state_before", "")
+                        tactic = step.get("tactic", "")
+                    elif isinstance(step, str):
+                        continue
+                    else:
+                        continue
+
+                    if not state or not tactic:
+                        continue
+                    if tactic.lower().strip() in BANNED_TACTICS:
+                        continue
+                    pairs.append(format_training_example(state.strip(), tactic.strip()))
+                continue
+
+            # Fallback: top-level fields
             state = ex.get("state_before") or ex.get("state") or ex.get("tactic_state", "")
             tactic = ex.get("tactic") or ex.get("action", "")
 
@@ -192,24 +222,40 @@ def extract_lean_workbook(input_dir: Path) -> list[dict]:
 
 
 def extract_goedel_pset_direct(input_dir: Path) -> list[dict]:
-    """Extract pre-traced pairs from Goedel-Pset (no Pantograph needed)."""
+    """Extract what we can from Goedel data without Pantograph.
+
+    Goedel-LM/Lean-workbook-proofs has {problem_id, full_proof} where
+    full_proof is a complete Lean file. We can't extract step-level pairs
+    without Pantograph replay, but we log what's available.
+    """
     pairs = []
     path = input_dir / "goedel_pset" / "train.jsonl"
     if not path.exists():
         logger.warning(f"Goedel-Pset data not found at {path}")
         return pairs
 
+    whole_proofs = 0
     with open(path) as f:
         for line in f:
             ex = json.loads(line)
+            # Check for pre-traced tactics (unlikely but handle it)
             if "traced_tactics" in ex:
                 for step in ex["traced_tactics"]:
-                    state = step.get("state_before", "")
-                    tactic = step.get("tactic", "")
-                    if state and tactic and tactic.lower().strip() not in BANNED_TACTICS:
-                        pairs.append(format_training_example(state.strip(), tactic.strip()))
+                    if isinstance(step, dict):
+                        state = step.get("state_before", "")
+                        tactic = step.get("tactic", "")
+                        if state and tactic and tactic.lower().strip() not in BANNED_TACTICS:
+                            pairs.append(format_training_example(state.strip(), tactic.strip()))
+            elif "full_proof" in ex:
+                whole_proofs += 1
 
-    logger.info(f"Goedel-Pset (pre-traced): extracted {len(pairs)} pairs")
+    if whole_proofs > 0 and not pairs:
+        logger.info(
+            f"Goedel-Pset: {whole_proofs} whole proofs found but need Pantograph replay "
+            f"to extract step-level pairs. Run with --lean-project and --pantograph flags."
+        )
+    else:
+        logger.info(f"Goedel-Pset (pre-traced): extracted {len(pairs)} pairs")
     return pairs
 
 

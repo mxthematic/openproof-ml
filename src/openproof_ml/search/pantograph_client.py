@@ -52,10 +52,24 @@ class PantographClient:
             "Build it: cd vendor/Pantograph && lake build repl"
         )
 
+    def _find_lake(self) -> str:
+        """Find the lake binary."""
+        # Check elan install location
+        elan_lake = Path.home() / ".elan" / "bin" / "lake"
+        if elan_lake.exists():
+            return str(elan_lake)
+        # Check PATH
+        import shutil
+        path = shutil.which("lake")
+        if path:
+            return path
+        raise FileNotFoundError("lake not found. Install elan: curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh")
+
     def _resolve_lean_path(self) -> str:
         """Get LEAN_PATH from the Lean project."""
+        lake = self._find_lake()
         result = subprocess.run(
-            ["lake", "env", "sh", "-c", "echo $LEAN_PATH"],
+            [lake, "env", "sh", "-c", "echo $LEAN_PATH"],
             cwd=self.lean_project_path,
             capture_output=True,
             text=True,
