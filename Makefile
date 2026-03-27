@@ -4,6 +4,10 @@ CONFIG ?= configs/sft_qwen35_2b.yaml
 LEAN_VERSION ?= v4.28.0
 MATHLIB_VERSION ?= v4.28.0
 
+ELAN_BIN = $(HOME)/.elan/bin
+LEAN_DIR = lean
+PANTOGRAPH_DIR = vendor/Pantograph
+
 # ── Full pipeline (one command on a fresh instance) ──────────────────
 
 all: setup-all download-data extract train-sft
@@ -15,22 +19,38 @@ setup:
 	pip install -e ".[dev]"
 	pre-commit install || true
 
-setup-lean:
-	@echo "=== Installing elan (Lean toolchain manager) ==="
-	curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:$(LEAN_VERSION)
-	@echo "=== Setting up Lean project with Mathlib ==="
-	mkdir -p lean
-	@echo 'leanprover/lean4:$(LEAN_VERSION)' > lean/lean-toolchain
-	@echo '[package]\nname = "openproof-ml-lean"\nversion = "0.1.0"\n\n[[require]]\nname = "mathlib"\ngit = "https://github.com/leanprover-community/mathlib4.git"\nrev = "$(MATHLIB_VERSION)"\n' > lean/lakefile.toml
-	cd lean && ~/.elan/bin/lake update
-	@echo "=== Downloading Mathlib cache ==="
-	cd lean && ~/.elan/bin/lake exe cache get || true
-	@echo "=== Building Pantograph ==="
-	mkdir -p vendor
-	git clone --depth 1 https://github.com/leanprover/Pantograph.git vendor/Pantograph || true
-	echo 'leanprover/lean4:$(LEAN_VERSION)' > vendor/Pantograph/lean-toolchain
-	cd vendor/Pantograph && ~/.elan/bin/lake build repl
+setup-lean: setup-lean-toolchain setup-lean-mathlib setup-lean-pantograph
 	@echo "=== Lean + Pantograph setup complete ==="
+
+setup-lean-toolchain:
+	@echo "=== Installing elan (Lean toolchain manager) ==="
+	@if [ ! -f $(ELAN_BIN)/lean ]; then \
+		curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:$(LEAN_VERSION); \
+	else \
+		echo "  elan already installed"; \
+	fi
+
+setup-lean-mathlib:
+	@echo "=== Setting up Lean project with Mathlib ==="
+	@mkdir -p $(LEAN_DIR)
+	@printf 'leanprover/lean4:%s\n' "$(LEAN_VERSION)" > $(LEAN_DIR)/lean-toolchain
+	@printf '[package]\nname = "openproof-ml-lean"\nversion = "0.1.0"\n\n[[require]]\nname = "mathlib"\ngit = "https://github.com/leanprover-community/mathlib4.git"\nrev = "%s"\n' "$(MATHLIB_VERSION)" > $(LEAN_DIR)/lakefile.toml
+	cd $(LEAN_DIR) && $(ELAN_BIN)/lake update
+	@echo "=== Downloading Mathlib cache ==="
+	cd $(LEAN_DIR) && $(ELAN_BIN)/lake exe cache get || echo "  Cache download failed (may need curl workaround). Continuing..."
+
+setup-lean-pantograph:
+	@echo "=== Building Pantograph for Lean $(LEAN_VERSION) ==="
+	@mkdir -p vendor
+	@if [ ! -d $(PANTOGRAPH_DIR)/.git ]; then \
+		git clone https://github.com/leanprover/Pantograph.git $(PANTOGRAPH_DIR); \
+	fi
+	@# Checkout the dev branch (latest) and apply our 4.28 compatibility patch
+	cd $(PANTOGRAPH_DIR) && git fetch origin dev && git checkout FETCH_HEAD
+	@printf 'leanprover/lean4:%s\n' "$(LEAN_VERSION)" > $(PANTOGRAPH_DIR)/lean-toolchain
+	cd $(PANTOGRAPH_DIR) && git apply ../../scripts/pantograph-v4.28.0.patch || echo "  Patch already applied or not needed"
+	cd $(PANTOGRAPH_DIR) && $(ELAN_BIN)/lake build repl
+	@echo "  Pantograph REPL built at $(PANTOGRAPH_DIR)/.lake/build/bin/repl"
 
 setup-all: setup setup-lean
 
@@ -44,7 +64,9 @@ extract:
 		--input data/raw \
 		--output data/processed/train.jsonl \
 		--val-output data/processed/val.jsonl \
-		--val-split 0.05
+		--val-split 0.05 \
+		--lean-project $(LEAN_DIR) \
+		--pantograph $(PANTOGRAPH_DIR)/.lake/build/bin/repl
 
 # ── Training ─────────────────────────────────────────────────────────
 

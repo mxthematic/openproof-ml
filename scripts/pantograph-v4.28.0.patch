@@ -1,0 +1,233 @@
+diff --git a/Main.lean b/Main.lean
+index ae40f26..e6545fc 100644
+--- a/Main.lean
++++ b/Main.lean
+@@ -16,18 +16,18 @@ def printImmediate (s : String) : IO Unit := do
+ 
+ /-- Parse a command either in `{ "cmd": ..., "payload": ... }` form or `cmd { ... }` form. -/
+ def parseCommand (s: String): Except String Command := do
+-  match String.Pos.Raw.get? s.trim 0 with
++  match s.trimAscii.startPos.get? with
+   | .some '{' =>
+     -- Parse in Json mode
+     Lean.fromJson? (← Lean.Json.parse s)
+   | .some _ =>
+     -- Parse in line mode
+-    let offset := s.posOf ' ' |> s.offsetOfPos
+-    if offset = s.length then
+-      return { cmd := s.take offset, payload := Lean.Json.null }
++    let offset := s.find ' '
++    if offset = s.endPos then
++      return { cmd := s.sliceTo offset |>.toString, payload := Lean.Json.null }
+     else
+-      let payload ← s.drop offset |> Lean.Json.parse
+-      return { cmd := s.take offset, payload := payload }
++      let payload ← (s.sliceFrom offset).toString |> Lean.Json.parse
++      return { cmd := (s.sliceTo offset).toString, payload := payload }
+   | .none =>
+     throw "Command is empty"
+ 
+@@ -35,7 +35,7 @@ partial def loop : MainM Unit := do repeat do
+   let state ← get
+   let command ← (← IO.getStdin).getLine
+   -- Halt the program if empty line is given
+-  if command.trim.length = 0 then break
++  if command.trimAscii.isEmpty then break
+   match parseCommand command with
+   | .error error =>
+     let error  := Lean.toJson ({ error := "command", desc := error }: InteractionError)
+@@ -64,7 +64,7 @@ def main (args: List String): IO Unit := do
+ 
+   -- Separate imports and options
+   let (options, imports) := args.partition (·.startsWith "--")
+-  let coreContext ← options.map (·.drop 2) |>.toArray |> Pantograph.createCoreContext
++  let coreContext ← options.map (·.drop 2 |>.toString) |>.toArray |> Pantograph.createCoreContext
+   let env ← Lean.importModules
+     (imports := imports.toArray.map ({ module := ·.toName }))
+     (opts := {})
+diff --git a/Pantograph/Delab.lean b/Pantograph/Delab.lean
+index 218e166..09cc734 100644
+--- a/Pantograph/Delab.lean
++++ b/Pantograph/Delab.lean
+@@ -158,9 +158,9 @@ partial def instantiateDelayedMVarsInner (expr : Expr) : ReaderT MVarIdSet MetaM
+   return result
+   where
+   self (mvarId : MVarId) (e : Expr) :=
+-    withReader (MVarIdSet.insert · mvarId) $ instantiateDelayedMVarsInner e
++    withReader (MVarIdSet.insert · mvarId) $ Core.withIncRecDepth $ instantiateDelayedMVarsInner e
+   self0 (e : Expr) :=
+-    instantiateDelayedMVarsInner e
++    Core.withIncRecDepth $ instantiateDelayedMVarsInner e
+ 
+ /--
+ Force the instantiation of delayed metavariables even if they cannot be fully
+diff --git a/Pantograph/Library.lean b/Pantograph/Library.lean
+index f01e501..d42a4a3 100644
+--- a/Pantograph/Library.lean
++++ b/Pantograph/Library.lean
+@@ -10,26 +10,26 @@ open Lean
+ /-- This is better than the default version since it handles `.` and doesn't
+  crash the program when it fails. -/
+ def setOptionFromString' (opts : Options) (entry : String) : ExceptT String IO Options := do
+-  let ps := (entry.splitOn "=").map String.trim
++  let ps := (entry.splitOn "=").map String.trimAscii
+   let [key, val] ← pure ps | throw "invalid configuration option entry, it must be of the form '<key> = <value>'"
+   let key := key.toName
+   let defValue ← getOptionDefaultValue key
+   match defValue with
+-  | DataValue.ofString _ => pure $ opts.setString key val
++  | DataValue.ofString _ => pure $ opts.set key val.toString
+   | DataValue.ofBool _   =>
+     match val with
+-    | "true" => pure $ opts.setBool key true
+-    | "false" => pure $ opts.setBool key false
++    | "true" => pure $ opts.set key true
++    | "false" => pure $ opts.set key false
+     | _ => throw  s!"invalid Bool option value '{val}'"
+-  | DataValue.ofName _   => pure $ opts.setName key val.toName
++  | DataValue.ofName _   => pure $ opts.set key val.toName
+   | DataValue.ofNat _    =>
+     match val.toNat? with
+     | none   => throw s!"invalid Nat option value '{val}'"
+-    | some v => pure $ opts.setNat key v
++    | some v => pure $ opts.set key v
+   | DataValue.ofInt _    =>
+     match val.toInt? with
+     | none   => throw s!"invalid Int option value '{val}'"
+-    | some v => pure $ opts.setInt key v
++    | some v => pure $ opts.set key v
+   | DataValue.ofSyntax _ => throw s!"invalid Syntax option value"
+ 
+ def runMetaM { α } (metaM: MetaM α): CoreM α :=
+diff --git a/Pantograph/Version.lean b/Pantograph/Version.lean
+index 62716b8..3e963e0 100644
+--- a/Pantograph/Version.lean
++++ b/Pantograph/Version.lean
+@@ -1,6 +1,6 @@
+ namespace Pantograph
+ 
+ @[export pantograph_version]
+-def version := "0.3.12"
++def version := "0.3.13"
+ 
+ end Pantograph
+diff --git a/Repl.lean b/Repl.lean
+index 3af4626..3a06435 100644
+--- a/Repl.lean
++++ b/Repl.lean
+@@ -562,7 +562,7 @@ def execute (command : Protocol.Command) : MainM Json := do
+       | throw $ .errorIndex s!"Invalid state index {args.stateId}"
+     let srcGoalState? ← match args.srcStateId? with
+       | .some id => do
+-        let .some srcGoalState := state.goalStates[args.stateId]?
++        let .some srcGoalState := state.goalStates[id]?
+           | throw $ .errorIndex s!"Invalid src state index {id}"
+         pure $ .some srcGoalState
+       | .none => pure .none
+diff --git a/Test/Delab.lean b/Test/Delab.lean
+index ec70f41..cd961f5 100644
+--- a/Test/Delab.lean
++++ b/Test/Delab.lean
+@@ -79,7 +79,7 @@ def test_sexp_of_expr (env: Environment): IO LSpec.TestSeq := do
+   let termElabM: Elab.TermElabM LSpec.TestSeq := entries.foldlM (λ suites (expr, target) => do
+     let env ← MonadEnv.getEnv
+     let testCaseName := target.take 10
+-    let test := LSpec.check   testCaseName ((← serializeExpressionSexp expr) = target)
++    let test := LSpec.check testCaseName.toString ((← serializeExpressionSexp expr) = target)
+     return LSpec.TestSeq.append suites test) LSpec.TestSeq.done
+   runMetaMSeq env $ termElabM.run' (ctx := defaultElabContext)
+ 
+diff --git a/Test/Frontend/Refactor.lean b/Test/Frontend/Refactor.lean
+index e0c03a3..b7dda08 100644
+--- a/Test/Frontend/Refactor.lean
++++ b/Test/Frontend/Refactor.lean
+@@ -14,13 +14,13 @@ private def test_merge_file_map : Test := λ _env ↦ do
+ set_option pp.explicit true
+ open Nat in
+ def f : Nat → Nat := id
+-  ".trim
++  ".trimAscii.toString
+   let src2 := "
+ set_option pp.explicit true
+ open Nat in
+ def f : Nat → Nat :=
+   id
+-  ".trim
++  ".trimAscii.toString
+   let filemap1 := s!"{src1}\n{src2}".toFileMap
+   let filemap2 := Refactor.mergeFileMap src1.toFileMap src2.toFileMap
+   checkEq "result" filemap1 filemap2
+@@ -40,9 +40,9 @@ set_option pp.explicit true
+ open Nat in
+ def f : Nat → Nat :=
+   id
+-  ".trim
++  ".trimAscii.toString
+   let result ← runRefactor env src
+-  checkEq "result" result.trim expected
++  checkEq "result" result.trimAscii.toString expected
+ 
+ private def test_simple : Test := λ env ↦ do
+   let src := "
+@@ -54,9 +54,9 @@ theorem mystery (n : Nat) : f n = n := sorry
+ /-- S1  -/
+ def f_composite : { f : Nat → Nat // ∀ (n : Nat), f n = n } :=
+   sorry
+-  ".trim
++  ".trimAscii.toString
+   let result ← runRefactor env src
+-  checkEq "result" result.trim expected
++  checkEq "result" result.trimAscii.toString expected
+ 
+ private def test_invalid : Test := λ env ↦ do
+   let src := "
+@@ -81,9 +81,9 @@ def helper (n : Nat) : Nat :=
+   n + 1
+ def f_composite : { f : Nat → Nat // ∀ (n : Nat), f n = helper n } :=
+   sorry
+-  ".trim
++  ".trimAscii.toString
+   let result ← runRefactor env src
+-  checkEq "result" result.trim expected
++  checkEq "result" result.trimAscii.toString expected
+ 
+ private def test_predicate : Test := λ env ↦ do
+   let src := "
+@@ -96,9 +96,9 @@ def q : (Nat → Nat) → Prop :=
+   sorry
+ def p_composite : { p : (Nat → Nat) → Prop // p Nat.succ } :=
+   sorry
+-  ".trim
++  ".trimAscii.toString
+   let result ← runRefactor env src
+-  checkEq "result" result.trim expected
++  checkEq "result" result.trimAscii.toString expected
+ 
+ def suite (env : Environment): List (String × IO LSpec.TestSeq) :=
+   let tests := [
+diff --git a/flake.lock b/flake.lock
+index 7bf1024..728f84c 100644
+--- a/flake.lock
++++ b/flake.lock
+@@ -42,11 +42,11 @@
+         "nixpkgs": "nixpkgs"
+       },
+       "locked": {
+-        "lastModified": 1766008374,
+-        "narHash": "sha256-ABLOpSeybmSa2+eWQVVUKh2C9/JzLIszSK3Zx7szMX0=",
++        "lastModified": 1771869703,
++        "narHash": "sha256-KNGPvsoTCqtGzqAlR/Yan9DdvFE9ptH5Sgz+JH/tz18=",
+         "owner": "lenianiva",
+         "repo": "lean4-nix",
+-        "rev": "e1e7451050e9a27fd469b544cef174fe9feca0e1",
++        "rev": "96acb827c24b99e159f71f698c6ef6715132c667",
+         "type": "github"
+       },
+       "original": {
+diff --git a/lean-toolchain b/lean-toolchain
+index e59446d..4c685fa 100644
+--- a/lean-toolchain
++++ b/lean-toolchain
+@@ -1 +1 @@
+-leanprover/lean4:v4.26.0
++leanprover/lean4:v4.28.0
