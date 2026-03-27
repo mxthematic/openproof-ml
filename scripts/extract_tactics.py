@@ -2,14 +2,16 @@
 """Extract (goal_state, tactic) pairs from proof datasets.
 
 Phase 1: Pre-traced datasets (LeanDojo, Lean Workbook) -- instant
-Phase 2: LeanDojo-v2 batch tracing of whole-proof datasets (Goedel)
+Phase 2: Pantograph frontend.process with invocations -- kernel-level extraction
 
 Usage:
     python scripts/extract_tactics.py \
         --input data/raw \
         --output data/processed/train.jsonl \
         --val-output data/processed/val.jsonl \
-        --val-split 0.05
+        --val-split 0.05 \
+        --pantograph vendor/Pantograph/.lake/build/bin/repl \
+        --lean-project lean
 """
 
 import argparse
@@ -17,8 +19,8 @@ import json
 import logging
 import os
 import random
-import shutil
-import traceback
+import subprocess
+import tempfile
 from pathlib import Path
 
 from openproof_ml.data.formatting import BANNED_TACTICS, format_training_example
@@ -82,129 +84,148 @@ def extract_lean_workbook(input_dir: Path) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: LeanDojo-v2 batch tracing
+# Phase 2: Pantograph frontend.process with invocations
 # ---------------------------------------------------------------------------
 
 
-def build_goedel_lean_project(input_dir: Path, project_dir: Path) -> int:
-    """Write all Goedel whole proofs into a single Lean project for batch tracing.
+class PantographFrontend:
+    """Pantograph REPL client using frontend.process for kernel-level extraction.
 
-    Each proof becomes a separate .lean file in the project. LeanDojo traces
-    the entire project at once, which is much faster than tracing individually.
-
-    Returns the number of proof files written.
+    Sends entire Lean files to Pantograph and gets back (goalBefore, tactic,
+    goalAfter) triples extracted by Lean's own elaborator. No regex parsing.
     """
+
+    def __init__(self, repl_path: str, lean_project_path: str):
+        self.repl_path = str(Path(repl_path).resolve())
+        self.lean_project_path = str(Path(lean_project_path).resolve())
+        self.process = None
+        self.lean_path = None
+
+    def start(self):
+        """Spawn the Pantograph REPL with Mathlib loaded."""
+        self.lean_path = self._resolve_lean_path()
+
+        self.process = subprocess.Popen(
+            [self.repl_path, "Mathlib"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "LEAN_PATH": self.lean_path},
+            cwd=self.lean_project_path,
+        )
+
+        ready = self.process.stdout.readline().decode().strip()
+        if not ready.startswith("ready"):
+            raise RuntimeError(f"Pantograph did not send ready: {ready}")
+        logger.info("Pantograph REPL ready")
+
+    def _resolve_lean_path(self) -> str:
+        lake = str(Path.home() / ".elan" / "bin" / "lake")
+        result = subprocess.run(
+            [lake, "env", "sh", "-c", "echo $LEAN_PATH"],
+            cwd=self.lean_project_path,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    def _send(self, cmd: str, payload: dict) -> dict:
+        msg = json.dumps({"cmd": cmd, "payload": payload})
+        self.process.stdin.write(f"{msg}\n".encode())
+        self.process.stdin.flush()
+        response = self.process.stdout.readline().decode().strip()
+        return json.loads(response)
+
+    def extract_invocations(self, lean_source: str) -> list[dict]:
+        """Send a Lean file to frontend.process and get tactic invocations.
+
+        Returns list of {"goalBefore": ..., "tactic": ..., "goalAfter": ...}
+        """
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            invocations_path = f.name
+
+        try:
+            response = self._send("frontend.process", {
+                "file": lean_source,
+                "readHeader": True,
+                "inheritEnv": False,
+                "newConstants": True,
+                "invocations": invocations_path,
+            })
+
+            # Check for errors
+            if "error" in response:
+                return []
+
+            # Read invocations file
+            try:
+                with open(invocations_path) as f:
+                    data = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                return []
+
+            invocations = []
+            for unit in data.get("units", []):
+                for inv in unit.get("invocations", []):
+                    invocations.append(inv)
+            return invocations
+        finally:
+            try:
+                os.unlink(invocations_path)
+            except OSError:
+                pass
+
+    def close(self):
+        if self.process:
+            self.process.terminate()
+            self.process.wait()
+            self.process = None
+
+
+def extract_goedel_pantograph(input_dir: Path, pantograph: PantographFrontend) -> list[dict]:
+    """Extract (state, tactic) pairs from Goedel whole proofs via Pantograph.
+
+    Uses frontend.process with invocations to get kernel-level tactic states.
+    Each proof is sent as a complete Lean file -- Pantograph handles parsing.
+    """
+    pairs = []
     path = input_dir / "goedel_pset" / "train.jsonl"
     if not path.exists():
-        return 0
+        logger.warning(f"Goedel-Pset data not found at {path}")
+        return pairs
 
-    project_dir.mkdir(parents=True, exist_ok=True)
+    traced = 0
+    failed = 0
 
-    # Write lean-toolchain and lakefile
-    (project_dir / "lean-toolchain").write_text("leanprover/lean4:v4.28.0\n")
-    (project_dir / "lakefile.toml").write_text(
-        'name = "goedel-proofs"\nversion = "0.1.0"\n\n'
-        '[[require]]\nname = "mathlib"\n'
-        'git = "https://github.com/leanprover-community/mathlib4.git"\n'
-        'rev = "v4.28.0"\n'
-    )
-
-    proofs_dir = project_dir / "Proofs"
-    proofs_dir.mkdir(exist_ok=True)
-
-    count = 0
     with open(path) as f:
-        for line in f:
+        for i, line in enumerate(f):
             ex = json.loads(line)
             full_proof = ex.get("full_proof", "")
             if not full_proof or ":= by" not in full_proof:
                 continue
 
-            # Write each proof as a separate file
-            proof_file = proofs_dir / f"P{count:05d}.lean"
-            proof_file.write_text(full_proof)
-            count += 1
+            invocations = pantograph.extract_invocations(full_proof)
 
-    logger.info(f"Wrote {count} proof files to {proofs_dir}")
-    return count
+            if invocations:
+                for inv in invocations:
+                    goal_before = inv.get("goalBefore", "")
+                    tactic = inv.get("tactic", "")
+                    if goal_before and tactic and tactic.lower().strip() not in BANNED_TACTICS:
+                        pairs.append(format_training_example(goal_before.strip(), tactic.strip()))
+                traced += 1
+            else:
+                failed += 1
 
+            if (i + 1) % 5000 == 0:
+                logger.info(
+                    f"  Goedel progress: {i+1} processed, "
+                    f"{traced} traced, {failed} failed, {len(pairs)} pairs"
+                )
 
-def trace_goedel_with_leandojo(project_dir: Path) -> list[dict]:
-    """Trace the Goedel proof project with LeanDojo-v2 and extract pairs."""
-    try:
-        from lean_dojo_v2.database import DynamicDatabase
-    except ImportError:
-        logger.warning(
-            "lean-dojo-v2 not installed. Skipping Goedel tracing. "
-            "Install with: pip install lean-dojo-v2"
-        )
-        return []
-
-    pairs = []
-    db = DynamicDatabase()
-
-    logger.info(f"Tracing project at {project_dir} with LeanDojo-v2...")
-    try:
-        # LeanDojo needs a git repo. Init one if needed.
-        import subprocess
-
-        abs_project = project_dir.resolve()
-        if not (abs_project / ".git").exists():
-            subprocess.run(["git", "init"], cwd=abs_project, capture_output=True)
-            subprocess.run(["git", "add", "."], cwd=abs_project, capture_output=True)
-            subprocess.run(
-                ["git", "commit", "-m", "initial"],
-                cwd=abs_project,
-                capture_output=True,
-                env={**os.environ, "GIT_AUTHOR_NAME": "x", "GIT_AUTHOR_EMAIL": "x@x",
-                     "GIT_COMMITTER_NAME": "x", "GIT_COMMITTER_EMAIL": "x@x"},
-            )
-
-        # Get the commit hash
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=abs_project,
-            capture_output=True,
-            text=True,
-        )
-        commit_hash = result.stdout.strip()
-        logger.info(f"Tracing commit {commit_hash}")
-
-        traced_repo = db.trace_repository(
-            url=str(abs_project),
-            commit=commit_hash,
-            build_deps=False,
-        )
-
-        for traced_file in traced_repo.traced_files:
-            for theorem in traced_file.traced_theorems:
-                for tt in theorem.get_traced_tactics(atomic_only=False):
-                    state = tt.state_before
-                    tactic = tt.tactic
-                    if state and tactic and tactic.lower().strip() not in BANNED_TACTICS:
-                        pairs.append(format_training_example(state.strip(), tactic.strip()))
-
-        logger.info(f"LeanDojo tracing: extracted {len(pairs)} pairs")
-    except Exception as e:
-        logger.error(f"LeanDojo tracing failed: {e}")
-        logger.error(traceback.format_exc())
-        logger.info("Falling back to Phase 1 data only")
-
+    logger.info(
+        f"Goedel-Pset (Pantograph): {traced} traced, {failed} failed, {len(pairs)} pairs"
+    )
     return pairs
-
-
-def extract_goedel_phase2(input_dir: Path) -> list[dict]:
-    """Full Phase 2: build project, trace with LeanDojo, extract pairs."""
-    project_dir = Path("data/goedel_lean_project")
-
-    # Build the Lean project from whole proofs
-    count = build_goedel_lean_project(input_dir, project_dir)
-    if count == 0:
-        logger.info("Goedel-Pset: no whole proofs to trace")
-        return []
-
-    # Trace with LeanDojo
-    return trace_goedel_with_leandojo(project_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +234,6 @@ def extract_goedel_phase2(input_dir: Path) -> list[dict]:
 
 
 def deduplicate(pairs: list[dict]) -> list[dict]:
-    """Remove exact duplicates."""
     seen = set()
     unique = []
     for p in pairs:
@@ -232,10 +252,9 @@ def main():
     parser.add_argument("--val-output", help="Validation JSONL path")
     parser.add_argument("--val-split", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--skip-phase2", action="store_true", help="Skip LeanDojo tracing")
-    # Legacy flags (ignored)
-    parser.add_argument("--lean-project", help="(ignored)")
-    parser.add_argument("--pantograph", help="(ignored)")
+    parser.add_argument("--pantograph", help="Path to Pantograph REPL binary")
+    parser.add_argument("--lean-project", help="Path to Lean project with Mathlib")
+    parser.add_argument("--skip-phase2", action="store_true", help="Skip Pantograph tracing")
     args = parser.parse_args()
 
     input_dir = Path(args.input)
@@ -247,10 +266,19 @@ def main():
     all_pairs.extend(extract_lean_workbook(input_dir))
     logger.info(f"Phase 1 total: {len(all_pairs)} pairs")
 
-    # Phase 2: LeanDojo tracing of whole-proof datasets
-    if not args.skip_phase2:
-        logger.info("=== Phase 2: LeanDojo-v2 tracing ===")
-        all_pairs.extend(extract_goedel_phase2(input_dir))
+    # Phase 2: Pantograph kernel-level extraction
+    if not args.skip_phase2 and args.pantograph and args.lean_project:
+        logger.info("=== Phase 2: Pantograph frontend.process ===")
+        pg = PantographFrontend(args.pantograph, args.lean_project)
+        try:
+            pg.start()
+            all_pairs.extend(extract_goedel_pantograph(input_dir, pg))
+        except Exception as e:
+            logger.error(f"Pantograph extraction failed: {e}")
+        finally:
+            pg.close()
+    elif not args.skip_phase2:
+        logger.info("=== Phase 2: Skipped (no --pantograph/--lean-project) ===")
     else:
         logger.info("=== Phase 2: Skipped (--skip-phase2) ===")
 
@@ -265,7 +293,6 @@ def main():
     val_pairs = all_pairs[:val_size]
     train_pairs = all_pairs[val_size:]
 
-    # Write
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
