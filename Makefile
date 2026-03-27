@@ -64,9 +64,15 @@ extract:
 		--input data/raw \
 		--output data/processed/train.jsonl \
 		--val-output data/processed/val.jsonl \
+		--val-split 0.05
+
+extract-fast:
+	python scripts/extract_tactics.py \
+		--input data/raw \
+		--output data/processed/train.jsonl \
+		--val-output data/processed/val.jsonl \
 		--val-split 0.05 \
-		--lean-project $(LEAN_DIR) \
-		--pantograph $(PANTOGRAPH_DIR)/.lake/build/bin/repl
+		--skip-phase2
 
 # ── Training ─────────────────────────────────────────────────────────
 

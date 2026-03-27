@@ -19,6 +19,7 @@ dependencies = [
     "pyyaml>=6.0",
     "wandb>=0.18",
     "tqdm>=4.66",
+    "lean-dojo-v2",
 ]
 
 [project.optional-dependencies]
