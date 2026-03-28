@@ -3,7 +3,6 @@
 CONFIG ?= configs/sft_qwen35_2b.yaml
 LEAN_VERSION ?= v4.28.0
 MATHLIB_VERSION ?= v4.28.0
-PANTOGRAPH_COMMIT ?= 5fcb754
 
 ELAN_BIN = $(HOME)/.elan/bin
 LEAN_DIR = lean
@@ -40,15 +39,12 @@ setup-lean-mathlib:
 
 setup-lean-pantograph:
 	@echo "=== Building Pantograph for Lean $(LEAN_VERSION) ==="
-	@mkdir -p vendor
-	@if [ ! -d $(PANTOGRAPH_DIR)/.git ]; then \
-		git clone https://github.com/leanprover/Pantograph.git $(PANTOGRAPH_DIR); \
-	fi
-	@# Checkout pinned commit, then overwrite files for 4.28 compatibility
-	cd $(PANTOGRAPH_DIR) && git fetch origin && git checkout $(PANTOGRAPH_COMMIT) -- . 2>/dev/null || git checkout $(PANTOGRAPH_COMMIT)
-	cd $(PANTOGRAPH_DIR) && git checkout -- .
-	echo "leanprover/lean4:$(LEAN_VERSION)" > $(PANTOGRAPH_DIR)/lean-toolchain
+	@# Clean slate: remove any previous build
+	rm -rf $(PANTOGRAPH_DIR)
+	git clone --depth 1 --branch dev https://github.com/leanprover/Pantograph.git $(PANTOGRAPH_DIR)
+	@# Apply 4.28 compatibility: override Library.lean and set toolchain
 	cp scripts/pantograph-overrides/Library.lean $(PANTOGRAPH_DIR)/Pantograph/Library.lean
+	echo "leanprover/lean4:$(LEAN_VERSION)" > $(PANTOGRAPH_DIR)/lean-toolchain
 	cd $(PANTOGRAPH_DIR) && $(ELAN_BIN)/lake update && $(ELAN_BIN)/lake build repl
 	@echo "  Pantograph REPL built at $(PANTOGRAPH_DIR)/.lake/build/bin/repl"
 
