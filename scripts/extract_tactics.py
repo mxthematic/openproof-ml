@@ -21,6 +21,7 @@ import os
 import random
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from openproof_ml.data.formatting import BANNED_TACTICS, format_training_example
@@ -223,21 +224,29 @@ def extract_goedel_pantograph(
                 restarts += 1
 
             try:
+                t0 = time.monotonic()
                 invocations = pg.extract_invocations(full_proof)
+                elapsed = time.monotonic() - t0
 
                 if invocations:
+                    n_before = len(pairs)
                     for inv in invocations:
                         goal_before = inv.get("goalBefore", "")
                         tactic = inv.get("tactic", "")
                         if goal_before and tactic and tactic.lower().strip() not in BANNED_TACTICS:
                             pairs.append(format_training_example(goal_before.strip(), tactic.strip()))
+                    n_new = len(pairs) - n_before
                     traced += 1
+                    if traced <= 5 or traced % 500 == 0:
+                        logger.info(f"  [{i}] traced in {elapsed:.1f}s, {n_new} pairs (total: {len(pairs)})")
                 else:
                     failed += 1
+                    if failed <= 5:
+                        logger.info(f"  [{i}] no invocations ({elapsed:.1f}s)")
             except Exception as e:
                 failed += 1
                 if failed <= 10:
-                    logger.debug(f"  Proof {i} failed: {e}")
+                    logger.info(f"  [{i}] exception: {e}")
 
             if (i + 1) % 1000 == 0:
                 logger.info(
