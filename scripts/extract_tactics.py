@@ -250,19 +250,12 @@ def _worker_extract_chunk(args: tuple) -> list[dict]:
                         pairs.append(format_training_example(goal_before.strip(), tactic.strip()))
                 n_new = len(pairs) - n_before
                 traced += 1
-                if local_idx < 3 or (local_idx + 1) % 200 == 0:
-                    logger.info(
-                        f"  W{worker_id} [{global_idx}] OK {elapsed:.1f}s "
-                        f"+{n_new} pairs (total: {len(pairs)})"
-                    )
             else:
                 failed += 1
         except Exception as e:
             failed += 1
-            if local_idx < 3 or (local_idx + 1) % 200 == 0:
-                logger.info(f"  W{worker_id} [{global_idx}] ERR: {e}")
 
-        if (local_idx + 1) % 500 == 0:
+        if (local_idx + 1) % 10 == 0:
             logger.info(
                 f"  W{worker_id}: {local_idx+1}/{len(proofs)} "
                 f"traced={traced} failed={failed} pairs={len(pairs)}"
