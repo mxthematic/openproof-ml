@@ -11,7 +11,11 @@ PANTOGRAPH_DIR = vendor/Pantograph
 
 # ── Full pipeline (one command on a fresh instance) ──────────────────
 
-all: setup-all download-data extract train-sft
+all: setup get-data train-sft
+	@echo "Pipeline complete. Run 'make eval' to benchmark."
+
+# Full pipeline with Lean (for re-extraction or expert iteration)
+all-lean: setup-all download-data extract train-sft
 	@echo "Pipeline complete. Run 'make eval' to benchmark."
 
 # ── Setup ────────────────────────────────────────────────────────────
@@ -58,6 +62,9 @@ setup-lean-pantograph:
 setup-all: setup setup-lean
 
 # ── Data ─────────────────────────────────────────────────────────────
+
+get-data:
+	python scripts/download_processed.py
 
 download-data:
 	bash scripts/download_data.sh

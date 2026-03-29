@@ -24,29 +24,36 @@ Everything from zero to trained model in one shot:
 ```bash
 git clone https://github.com/markm39/openproof-ml.git
 cd openproof-ml
-make all    # installs everything, downloads data, extracts, trains
+make all    # installs deps, downloads data from HuggingFace, trains
 ```
 
 Or step by step:
 
 ```bash
-# 1. Install Python deps + Lean toolchain + Mathlib + Pantograph
-make setup-all
+# 1. Install Python deps
+make setup
 
-# 2. Download training data (LeanDojo, Lean Workbook, Goedel-Pset)
-make download-data
+# 2. Download pre-extracted training data from HuggingFace (~350K pairs)
+make get-data
 
-# 3. Extract (state, tactic) pairs into training JSONL
-make extract
-
-# 4. Train SFT (needs GPU)
+# 3. Train SFT (needs GPU)
 make train-sft CONFIG=configs/sft_qwen35_2b.yaml
 
-# 5. Evaluate on MiniF2F
+# 4. Evaluate on MiniF2F
 make eval CONFIG=configs/eval_minif2f.yaml
 
-# 6. Export to GGUF + ollama
+# 5. Export to GGUF + ollama
 make export CONFIG=configs/export.yaml
+```
+
+### Re-extracting data from scratch (optional)
+
+If you want to re-extract training data from source (requires Lean + Pantograph):
+
+```bash
+make setup-all          # installs Lean, Mathlib, Pantograph
+make download-data      # downloads raw datasets
+make extract            # extracts (state, tactic) pairs via Pantograph
 ```
 
 ### Prerequisites
