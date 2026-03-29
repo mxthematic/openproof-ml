@@ -27,7 +27,7 @@ training:
   max_grad_norm: 1.0
   fp16: false
   bf16: true
-  logging_steps: 10
+  logging_steps: 1
   save_steps: 500
   eval_steps: 500
   seed: 42
