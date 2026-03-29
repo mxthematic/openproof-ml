@@ -13,6 +13,7 @@ from peft import LoraConfig, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    DataCollatorForSeq2Seq,
     Trainer,
     TrainingArguments,
 )
@@ -125,12 +126,19 @@ def main():
         dataloader_num_workers=4,
     )
 
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        padding=True,
+        label_pad_token_id=-100,
+    )
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized["train"],
         eval_dataset=tokenized.get("validation"),
         processing_class=tokenizer,
+        data_collator=data_collator,
     )
 
     # Resume from checkpoint if one exists
