@@ -1,6 +1,7 @@
 .PHONY: setup setup-lean setup-all download-data extract train-sft train-expert-iter train-dapo eval export test lint format clean
 
 CONFIG ?= configs/sft_qwen35_2b.yaml
+WORKERS ?= 4
 LEAN_VERSION ?= v4.28.0
 MATHLIB_VERSION ?= v4.28.0
 
@@ -62,7 +63,8 @@ extract:
 		--val-output data/processed/val.jsonl \
 		--val-split 0.05 \
 		--pantograph $(PANTOGRAPH_DIR)/.lake/build/bin/repl \
-		--lean-project $(LEAN_DIR)
+		--lean-project $(LEAN_DIR) \
+		--workers $(WORKERS)
 
 extract-fast:
 	python scripts/extract_tactics.py \

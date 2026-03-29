@@ -213,77 +213,121 @@ class PantographFrontend:
             self.process = None
 
 
-def extract_goedel_pantograph(
-    input_dir: Path, repl_path: str, lean_project: str
-) -> list[dict]:
-    """Extract (state, tactic) pairs from Goedel whole proofs via Pantograph.
+def _worker_extract_chunk(args: tuple) -> list[dict]:
+    """Worker function: process a chunk of proofs with its own Pantograph instance.
 
-    Uses frontend.process with invocations to get kernel-level tactic states.
-    Each proof is sent as a complete Lean file -- Pantograph handles parsing.
-    Automatically restarts Pantograph if it crashes.
+    Each worker spawns its own Pantograph REPL (~18s startup), then processes
+    its assigned proofs independently. Automatically restarts on crash.
     """
+    worker_id, proofs, repl_path, lean_project = args
     pairs = []
-    path = input_dir / "goedel_pset" / "train.jsonl"
-    if not path.exists():
-        logger.warning(f"Goedel-Pset data not found at {path}")
-        return pairs
-
     traced = 0
     failed = 0
     restarts = 0
 
     pg = PantographFrontend(repl_path, lean_project)
     pg.start()
+    logger.info(f"  Worker {worker_id}: started, processing {len(proofs)} proofs")
 
+    for local_idx, (global_idx, full_proof) in enumerate(proofs):
+        if not pg.is_alive():
+            pg.close()
+            pg = PantographFrontend(repl_path, lean_project)
+            pg.start()
+            restarts += 1
+
+        try:
+            t0 = time.monotonic()
+            invocations = pg.extract_invocations(full_proof)
+            elapsed = time.monotonic() - t0
+
+            if invocations:
+                n_before = len(pairs)
+                for inv in invocations:
+                    goal_before = inv.get("goalBefore", "")
+                    tactic = inv.get("tactic", "")
+                    if goal_before and tactic and tactic.lower().strip() not in BANNED_TACTICS:
+                        pairs.append(format_training_example(goal_before.strip(), tactic.strip()))
+                n_new = len(pairs) - n_before
+                traced += 1
+                if local_idx < 3 or (local_idx + 1) % 200 == 0:
+                    logger.info(
+                        f"  W{worker_id} [{global_idx}] OK {elapsed:.1f}s "
+                        f"+{n_new} pairs (total: {len(pairs)})"
+                    )
+            else:
+                failed += 1
+        except Exception as e:
+            failed += 1
+            if local_idx < 3 or (local_idx + 1) % 200 == 0:
+                logger.info(f"  W{worker_id} [{global_idx}] ERR: {e}")
+
+        if (local_idx + 1) % 500 == 0:
+            logger.info(
+                f"  W{worker_id}: {local_idx+1}/{len(proofs)} "
+                f"traced={traced} failed={failed} pairs={len(pairs)}"
+            )
+
+    pg.close()
+    logger.info(
+        f"  Worker {worker_id} done: {traced} traced, {failed} failed, "
+        f"{restarts} restarts, {len(pairs)} pairs"
+    )
+    return pairs
+
+
+def extract_goedel_pantograph(
+    input_dir: Path, repl_path: str, lean_project: str, num_workers: int = 1,
+) -> list[dict]:
+    """Extract (state, tactic) pairs from Goedel whole proofs via Pantograph.
+
+    Uses frontend.process with invocations to get kernel-level tactic states.
+    Spawns num_workers parallel Pantograph instances for throughput.
+    """
+    path = input_dir / "goedel_pset" / "train.jsonl"
+    if not path.exists():
+        logger.warning(f"Goedel-Pset data not found at {path}")
+        return []
+
+    # Pre-read all proofs into memory
+    logger.info(f"Loading proofs from {path}...")
+    proofs = []
     with open(path) as f:
         for i, line in enumerate(f):
             ex = json.loads(line)
             full_proof = ex.get("full_proof", "")
-            if not full_proof or ":= by" not in full_proof:
-                continue
+            if full_proof and ":= by" in full_proof:
+                proofs.append((i, full_proof))
+    logger.info(f"Loaded {len(proofs)} proofs to process")
 
-            # Restart Pantograph if it died
-            if not pg.is_alive():
-                logger.info(f"  Pantograph died at proof {i}, restarting...")
-                pg.close()
-                pg = PantographFrontend(repl_path, lean_project)
-                pg.start()
-                restarts += 1
+    if not proofs:
+        return []
 
-            try:
-                t0 = time.monotonic()
-                invocations = pg.extract_invocations(full_proof)
-                elapsed = time.monotonic() - t0
+    if num_workers <= 1:
+        # Single-worker path (no multiprocessing overhead)
+        return _worker_extract_chunk((0, proofs, repl_path, lean_project))
 
-                if invocations:
-                    n_before = len(pairs)
-                    for inv in invocations:
-                        goal_before = inv.get("goalBefore", "")
-                        tactic = inv.get("tactic", "")
-                        if goal_before and tactic and tactic.lower().strip() not in BANNED_TACTICS:
-                            pairs.append(format_training_example(goal_before.strip(), tactic.strip()))
-                    n_new = len(pairs) - n_before
-                    traced += 1
-                    logger.info(f"  [{i}] OK {elapsed:.1f}s +{n_new} pairs (total: {len(pairs)})")
-                else:
-                    failed += 1
-                    logger.info(f"  [{i}] empty {elapsed:.1f}s")
-            except Exception as e:
-                failed += 1
-                logger.info(f"  [{i}] ERR: {e}")
+    # Shard proofs across workers
+    from multiprocessing import Pool
 
-            if (i + 1) % 1000 == 0:
-                logger.info(
-                    f"  Goedel progress: {i+1} processed, "
-                    f"{traced} traced, {failed} failed, {restarts} restarts, {len(pairs)} pairs"
-                )
+    chunk_size = (len(proofs) + num_workers - 1) // num_workers
+    chunks = []
+    for w in range(num_workers):
+        start = w * chunk_size
+        end = min(start + chunk_size, len(proofs))
+        if start < len(proofs):
+            chunks.append((w, proofs[start:end], repl_path, lean_project))
 
-    pg.close()
-    logger.info(
-        f"Goedel-Pset (Pantograph): {traced} traced, {failed} failed, "
-        f"{restarts} restarts, {len(pairs)} pairs"
-    )
-    return pairs
+    logger.info(f"Spawning {len(chunks)} workers ({chunk_size} proofs each)")
+
+    all_pairs = []
+    with Pool(processes=len(chunks)) as pool:
+        results = pool.map(_worker_extract_chunk, chunks)
+        for worker_pairs in results:
+            all_pairs.extend(worker_pairs)
+
+    logger.info(f"Goedel-Pset (parallel): {len(all_pairs)} pairs from {len(proofs)} proofs")
+    return all_pairs
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +357,7 @@ def main():
     parser.add_argument("--pantograph", help="Path to Pantograph REPL binary")
     parser.add_argument("--lean-project", help="Path to Lean project with Mathlib")
     parser.add_argument("--skip-phase2", action="store_true", help="Skip Pantograph tracing")
+    parser.add_argument("--workers", type=int, default=1, help="Parallel Pantograph workers for Phase 2")
     args = parser.parse_args()
 
     input_dir = Path(args.input)
@@ -326,9 +371,9 @@ def main():
 
     # Phase 2: Pantograph kernel-level extraction
     if not args.skip_phase2 and args.pantograph and args.lean_project:
-        logger.info("=== Phase 2: Pantograph frontend.process ===")
+        logger.info(f"=== Phase 2: Pantograph frontend.process ({args.workers} workers) ===")
         all_pairs.extend(
-            extract_goedel_pantograph(input_dir, args.pantograph, args.lean_project)
+            extract_goedel_pantograph(input_dir, args.pantograph, args.lean_project, num_workers=args.workers)
         )
     elif not args.skip_phase2:
         logger.info("=== Phase 2: Skipped (no --pantograph/--lean-project) ===")
