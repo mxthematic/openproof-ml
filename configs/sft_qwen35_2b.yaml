@@ -10,7 +10,7 @@ model:
 data:
   train_file: data/processed/train.jsonl
   val_file: data/processed/val.jsonl
-  max_seq_length: 1024
+  max_seq_length: 2048
   prompt_field: prompt      # "{goal_state}:::"
   completion_field: completion  # tactic string
 
