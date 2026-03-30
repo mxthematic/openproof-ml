@@ -1,0 +1,26 @@
+# Expert play with Codex CLI using ChatGPT OAuth login.
+codex:
+  codex_bin: codex
+  model: null
+  reasoning_effort: minimal
+  verbosity: low
+  timeout: 120
+  sandbox: read-only
+  workdir: /tmp/openproof-codex-worker
+
+search:
+  beam_width: 5
+  max_expansions: 24
+  timeout: 60
+  max_depth: 8
+  length_penalty: 0.05
+
+data:
+  problems_path: data/raw/goedel_pset/statements.jsonl
+  output_dir: data/codex_expert
+  max_problems: 10
+  seed: 42
+
+pantograph:
+  lean_project_path: lean
+  repl_path: vendor/Pantograph/.lake/build/bin/repl
