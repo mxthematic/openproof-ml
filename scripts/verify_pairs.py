@@ -30,25 +30,41 @@ from openproof_ml.search.pantograph_client import PantographClient
 logger = logging.getLogger(__name__)
 
 
-def verify_pair(pg: PantographClient, goal_state: str, tactic: str) -> bool:
-    """Verify a single (goal_state, tactic) pair via Pantograph.
+def verify_pair(pg: PantographClient, goal_state: str, tactic: str) -> dict | None:
+    """Verify a (goal_state, tactic) pair via Pantograph.
 
-    Returns True if the tactic is accepted by Lean (changes or closes the goal).
+    Returns a dict with verification info if the tactic succeeds, None if it fails.
+    Only returns results where the tactic actually makes progress (closes goal
+    or reduces remaining goals).
     """
     state_id = pg.start_goal(goal_state)
     if state_id is None:
-        return False
+        return None
 
     try:
         result = pg.try_tactic(state_id, 0, tactic)
-        return result.success and result.new_state_id is not None
+        if not result.success or result.new_state_id is None:
+            return None
+
+        closes_goal = len(result.remaining_goals) == 0
+        remaining = result.remaining_goals
+
+        # Only keep tactics that close the goal entirely
+        if not closes_goal:
+            return None
+
+        return {
+            "closes_goal": closes_goal,
+            "remaining_goals": len(remaining),
+        }
     except Exception:
-        return False
+        return None
     finally:
-        try:
-            pg.delete_goal(state_id)
-        except Exception:
-            pass
+        for sid in [state_id] + ([result.new_state_id] if 'result' in dir() and result.new_state_id else []):
+            try:
+                pg.delete_goal(sid)
+            except Exception:
+                pass
 
 
 def main():
@@ -103,9 +119,12 @@ def main():
             pg = PantographClient(args.lean_project, args.pantograph)
             pg.start()
 
-        # Verify
-        if verify_pair(pg, goal, tactic):
-            verified.append(format_training_example(goal, tactic))
+        # Verify -- only keep tactics that close the goal
+        result = verify_pair(pg, goal, tactic)
+        if result is not None:
+            example = format_training_example(goal, tactic)
+            example["closes_goal"] = result["closes_goal"]
+            verified.append(example)
         else:
             rejected.append(pair)
 
